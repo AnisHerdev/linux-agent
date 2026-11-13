@@ -46,19 +46,19 @@ The solution is cleanly separated into two independent components communicating 
 
 ```mermaid
 flowchart TD
-    User([Human Operator]) <--> CLI["Terminal Interface (Rich CLI)"]
+    User(["Human Operator"]) <--> CLI["Terminal Interface (Rich CLI)"]
     CLI <--> Agent["LangChain Agent (agent.py)"]
     
-    subgraph Middleware Pipeline
+    subgraph SubMiddleware ["Middleware Pipeline"]
         Agent --> M1["Guardrail Middleware (@wrap_model_call)"]
         M1 --> LLM["OpenAI Model (gpt-5.6-luna)"]
         Agent --> M2["Tool Call Logger (@wrap_tool_call)"]
         Agent --> M3["Context Summarization (SummarizationMiddleware)"]
     end
     
-    subgraph Model Context Protocol (MCP Stdio)
+    subgraph SubMCP ["Model Context Protocol (MCP Stdio)"]
         M2 <--> ClientSession["MCP Client Session (langchain-mcp-adapters)"]
-        ClientSession <== stdio ==> Server["FastMCP Server (mcp_server.py)"]
+        ClientSession <-->|stdio| Server["FastMCP Server (mcp_server.py)"]
         Server --> T1["get_vm_status"]
         Server --> T2["get_cpu_usage"]
         Server --> T3["get_memory_usage"]
@@ -66,8 +66,12 @@ flowchart TD
         Server --> T5["get_large_directories"]
     end
 
-    subgraph Simulated Environment
-        T1 & T2 & T3 & T4 & T5 --> Catalog[("Simulated Host Catalog\nVM001 | VM002 | VM003")]
+    subgraph SubSim ["Simulated Environment"]
+        T1 --> Catalog[("Simulated Host Catalog: VM001, VM002, VM003")]
+        T2 --> Catalog
+        T3 --> Catalog
+        T4 --> Catalog
+        T5 --> Catalog
     end
 ```
 
