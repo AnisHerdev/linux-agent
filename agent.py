@@ -4,17 +4,19 @@ Part of OpsPilot AI: Agentic Linux & Cloud Infrastructure Monitoring System.
 
 Connects to mcp_server.py via MCP stdio transport.
 Features:
-- OpenAI reasoning
+- OpenAI gpt-5.6luna reasoning with reasoning_effort set to 'none'
 - LangChain Tool-Calling Agent with modern Middleware
 - @wrap_model_call Guardrail Middleware (Read-Only Safety & Correctness)
+- @wrap_tool_call Middleware for Real-Time Tool Call Observability
 - SummarizationMiddleware for Context Management
 - Pydantic Data Validation
 - Human-in-the-Loop (HITL) approval gate
-- Rich terminal formatting and interactive Q&A
+- Rich terminal formatting, visible tool executions, and interactive Q&A
 """
 
 import os
 import sys
+import re
 import json
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -28,8 +30,9 @@ load_dotenv()
 # OpenAI & Model Configuration
 # ==========================================
 
-# OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
-MODEL_NAME = "gpt-4.1-mini"
+OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
+MODEL_NAME = "gpt-5.6luna"
+REASONING_EFFORT = "none"
 
 # Rich CLI formatting
 from rich.console import Console
@@ -50,8 +53,58 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 # LangChain Imports
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
-from langchain.agents.middleware import wrap_model_call, SummarizationMiddleware, ModelRequest, ModelResponse
+from langchain.agents.middleware import (
+    wrap_model_call,
+    wrap_tool_call,
+    SummarizationMiddleware,
+    ModelRequest,
+    ModelResponse,
+    ToolCallRequest
+)
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
+
+
+# ==========================================
+# Natural Language VM ID Extraction
+# ==========================================
+
+def extract_vm_id(user_text: str) -> Optional[str]:
+    """Intelligently extracts a valid VM ID (VM001, VM002, VM003) from natural language input.
+    
+    Examples:
+    - 'VM001' -> 'VM001'
+    - 'i want to investigate vm001 please' -> 'VM001'
+    - 'check 2' -> 'VM002'
+    - 'investigate the healthy one' -> 'VM001'
+    """
+    if not user_text:
+        return None
+
+    # 1. Direct regex matching VM001, VM002, VM003
+    match = re.search(r"\b(VM00[1-3])\b", user_text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    # 2. Match general VM format (e.g. VM1, VM01, VM001)
+    gen_match = re.search(r"\bVM0*([1-3])\b", user_text, re.IGNORECASE)
+    if gen_match:
+        return f"VM00{gen_match.group(1)}"
+
+    # 3. Match numeric shortcuts 1, 2, 3
+    num_match = re.search(r"\b([1-3])\b", user_text)
+    if num_match:
+        return f"VM00{num_match.group(1)}"
+
+    # 4. Contextual descriptive words
+    lower = user_text.lower()
+    if any(k in lower for k in ["healthy", "prod-web", "web-01"]):
+        return "VM001"
+    if any(k in lower for k in ["critical", "prod-db", "analytics", "high usage", "database"]):
+        return "VM002"
+    if any(k in lower for k in ["offline", "dead", "staging", "unreachable"]):
+        return "VM003"
+
+    return None
 
 
 # ==========================================
@@ -62,6 +115,8 @@ class TelemetrySnapshot(BaseModel):
     """Pydantic model validating complete telemetry retrieved for a VM."""
     vm_id: str
     status: str
+    is_valid_vm: bool = True
+    error_message: Optional[str] = None
     hostname: Optional[str] = None
     os: Optional[str] = None
     uptime: Optional[str] = None
@@ -79,7 +134,7 @@ class TelemetrySnapshot(BaseModel):
 class AnalysisReport(BaseModel):
     """Pydantic model validating structured AI health report."""
     vm_id: str
-    overall_health: str = Field(..., description="Healthy, Warning, Critical, or Offline")
+    overall_health: str = Field(..., description="Healthy, Warning, Critical, Offline, or Error")
     summary: str = Field(..., description="High-level assessment summary")
     critical_issues: List[str] = Field(default_factory=list)
     recommendations: List[str] = Field(default_factory=list)
@@ -90,7 +145,7 @@ class AnalysisReport(BaseModel):
 
 
 # ==========================================
-# LangChain Middleware: Guardrails & Safety
+# LangChain Middleware: Observability & Guardrails
 # ==========================================
 
 DISALLOWED_PATTERNS = [
@@ -106,12 +161,10 @@ def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
     2. Invocation: Calls the underlying model handler.
     3. Post-invocation: Verifies response correctness, advisory tone, and disclaimer.
     """
-    # 1. Pre-call inspection: Check for disallowed destructive command requests
     for msg in request.messages:
         content = str(getattr(msg, "content", ""))
         for pattern in DISALLOWED_PATTERNS:
             if pattern in content.lower() and "do not execute" not in content.lower():
-                # Block command execution attempts and enforce advisory framing
                 request.system_prompt = (
                     f"{request.system_prompt or ''}\n\n"
                     "GUARDRAIL ALERT: The user may have referenced system commands. "
@@ -120,10 +173,8 @@ def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
                 )
                 break
 
-    # 2. Invoke the model
     response = handler(request)
 
-    # 3. Post-call verification: Ensure the model did not claim changes were applied
     raw_content = ""
     if hasattr(response, "content") and response.content:
         raw_content = str(response.content)
@@ -143,9 +194,39 @@ def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
     return response
 
 
+@wrap_tool_call
+def visible_tool_logger(request: ToolCallRequest, handler):
+    """Tool middleware providing visible terminal logs whenever the agent invokes a tool."""
+    tool_call = request.tool_call
+    tool_name = tool_call.get("name") if isinstance(tool_call, dict) else getattr(tool_call, "name", "unknown")
+    tool_args = tool_call.get("args") if isinstance(tool_call, dict) else getattr(tool_call, "args", {})
+
+    console.print(f"[bold cyan]🔧 [AGENT TOOL CALL][/bold cyan] [bold yellow]{tool_name}[/bold yellow]({tool_args})")
+    result = handler(request)
+
+    # Format the preview output cleanly
+    res_str = str(result)
+    if len(res_str) > 250:
+        res_str = res_str[:250] + "..."
+    console.print(f"[bold green]✓ [AGENT TOOL RESULT][/bold green] [dim]{res_str}[/dim]\n")
+    return result
+
+
 # ==========================================
-# Telemetry Retrieval & UI Presentation
+# Telemetry Retrieval & Tool Execution
 # ==========================================
+
+async def _invoke_tool_visible(tool: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Invokes an MCP tool with clear terminal output for observability."""
+    console.print(f"[bold cyan]🔧 MCP Tool Call:[/bold cyan] [bold yellow]{tool.name}[/bold yellow]({args})")
+    res = await tool.ainvoke(args)
+    payload = _extract_tool_payload(res)
+    res_str = str(payload)
+    if len(res_str) > 250:
+        res_str = res_str[:250] + "..."
+    console.print(f"[bold green]✓ MCP Tool Output:[/bold green] [dim]{res_str}[/dim]\n")
+    return payload
+
 
 async def fetch_vm_telemetry(tools_map: Dict[str, Any], vm_id: str) -> TelemetrySnapshot:
     """Interacts with MCP tools to gather and validate telemetry snapshot via Pydantic."""
@@ -153,32 +234,36 @@ async def fetch_vm_telemetry(tools_map: Dict[str, Any], vm_id: str) -> Telemetry
 
     # Step 1: Check VM availability
     status_tool = tools_map.get("get_vm_status")
-    status_res = await status_tool.ainvoke({"vm_id": norm_id})
-    status_data = _extract_tool_payload(status_res)
+    status_data = await _invoke_tool_visible(status_tool, {"vm_id": norm_id})
 
-    if status_data.get("status") == "dead" or "error" in status_data:
+    if "error" in status_data:
         return TelemetrySnapshot(
             vm_id=norm_id,
-            status=status_data.get("status", "dead"),
+            status="not_found",
+            is_valid_vm=False,
+            error_message=status_data.get("error")
+        )
+
+    if status_data.get("status") == "dead":
+        return TelemetrySnapshot(
+            vm_id=norm_id,
+            status="dead",
+            is_valid_vm=True,
             hostname=status_data.get("hostname"),
             os=status_data.get("os"),
             uptime=None
         )
 
     # Step 2: Retrieve resource metrics for alive VM
-    cpu_res = await tools_map["get_cpu_usage"].ainvoke({"vm_id": norm_id})
-    mem_res = await tools_map["get_memory_usage"].ainvoke({"vm_id": norm_id})
-    disk_res = await tools_map["get_disk_usage"].ainvoke({"vm_id": norm_id})
-    dirs_res = await tools_map["get_large_directories"].ainvoke({"vm_id": norm_id})
-
-    cpu_data = _extract_tool_payload(cpu_res)
-    mem_data = _extract_tool_payload(mem_res)
-    disk_data = _extract_tool_payload(disk_res)
-    dirs_data = _extract_tool_payload(dirs_res)
+    cpu_data = await _invoke_tool_visible(tools_map["get_cpu_usage"], {"vm_id": norm_id})
+    mem_data = await _invoke_tool_visible(tools_map["get_memory_usage"], {"vm_id": norm_id})
+    disk_data = await _invoke_tool_visible(tools_map["get_disk_usage"], {"vm_id": norm_id})
+    dirs_data = await _invoke_tool_visible(tools_map["get_large_directories"], {"vm_id": norm_id})
 
     return TelemetrySnapshot(
         vm_id=norm_id,
         status="alive",
+        is_valid_vm=True,
         hostname=status_data.get("hostname"),
         os=status_data.get("os"),
         uptime=status_data.get("uptime"),
@@ -215,11 +300,21 @@ def _extract_tool_payload(tool_output: Any) -> Dict[str, Any]:
 
 def display_telemetry_tables(telemetry: TelemetrySnapshot):
     """Renders Rich formatted telemetry tables with color-coded health indicators."""
+    if not telemetry.is_valid_vm:
+        console.print(Panel(
+            f"[bold red]✖ Virtual Machine Not Found[/bold red]\n"
+            f"[yellow]{telemetry.error_message or 'Invalid VM identifier specified.'}[/yellow]\n"
+            f"[white]Available valid simulated VMs are: [bold cyan]VM001[/bold cyan], [bold cyan]VM002[/bold cyan], [bold cyan]VM003[/bold cyan].[/white]",
+            title=f"Infrastructure Telemetry — {telemetry.vm_id}",
+            border_style="red"
+        ))
+        return
+
     if telemetry.status == "dead":
         console.print(Panel(
             f"[bold red]✖ VM Status: OFFLINE / DEAD[/bold red]\n"
-            f"[yellow]The machine '{telemetry.vm_id}' is unreachable or shut down.\n"
-            "Resource metrics (CPU, RAM, Disk) cannot be collected.[/yellow]",
+            f"[yellow]The machine '{telemetry.vm_id}' ({telemetry.hostname or 'staging-worker-03'}) is unreachable or shut down.\n"
+            "Resource metrics (CPU, RAM, Disk) cannot be collected while the machine is offline.[/yellow]",
             title=f"Infrastructure Telemetry — {telemetry.vm_id}",
             border_style="red"
         ))
@@ -232,25 +327,18 @@ def display_telemetry_tables(telemetry: TelemetrySnapshot):
     table.add_column("Details", style="magenta")
     table.add_column("Health Status", justify="center")
 
-    # Status row
     table.add_row("Availability", "Alive", f"OS: {telemetry.os} | Uptime: {telemetry.uptime}", "[green]✓ Healthy[/green]")
 
-    # CPU row
     cpu_val = f"{telemetry.cpu_percent:.1f}%" if telemetry.cpu_percent is not None else "N/A"
-    cpu_style = _get_health_badge(telemetry.cpu_percent)
-    table.add_row("CPU Utilization", cpu_val, f"Threshold: {telemetry.cpu_threshold}", cpu_style)
+    table.add_row("CPU Utilization", cpu_val, f"Threshold: {telemetry.cpu_threshold}", _get_health_badge(telemetry.cpu_percent))
 
-    # Memory row
     mem_val = f"{telemetry.memory_percent:.1f}%" if telemetry.memory_percent is not None else "N/A"
     mem_det = f"{telemetry.memory_used_mb} MB / {telemetry.memory_total_mb} MB" if telemetry.memory_used_mb else "N/A"
-    mem_style = _get_health_badge(telemetry.memory_percent)
-    table.add_row("Memory (RAM)", mem_val, mem_det, mem_style)
+    table.add_row("Memory (RAM)", mem_val, mem_det, _get_health_badge(telemetry.memory_percent))
 
-    # Disk row
     disk_val = f"{telemetry.disk_percent:.1f}%" if telemetry.disk_percent is not None else "N/A"
     disk_det = f"{telemetry.disk_used_gb} GB / {telemetry.disk_total_gb} GB" if telemetry.disk_used_gb else "N/A"
-    disk_style = _get_health_badge(telemetry.disk_percent)
-    table.add_row("Disk Storage", disk_val, disk_det, disk_style)
+    table.add_row("Disk Storage", disk_val, disk_det, _get_health_badge(telemetry.disk_percent))
 
     console.print(table)
 
@@ -296,6 +384,15 @@ async def run_ai_investigation(
     telemetry: TelemetrySnapshot
 ) -> AnalysisReport:
     """Uses the OpenAI model to produce a structured infrastructure health report."""
+    if not telemetry.is_valid_vm:
+        return AnalysisReport(
+            vm_id=telemetry.vm_id,
+            overall_health="Error",
+            summary=f"Virtual machine '{telemetry.vm_id}' is not in the infrastructure catalog. Valid VMs: VM001, VM002, VM003.",
+            critical_issues=["Invalid VM ID specified."],
+            recommendations=["Specify one of the valid virtual machine identifiers: VM001, VM002, or VM003."]
+        )
+
     if telemetry.status == "dead":
         return AnalysisReport(
             vm_id=telemetry.vm_id,
@@ -312,7 +409,7 @@ async def run_ai_investigation(
             ]
         )
 
-    # Prepare analysis prompt for OpenAI
+    # Telemetry summary for model
     telemetry_summary = (
         f"Virtual Machine: {telemetry.vm_id} ({telemetry.hostname})\n"
         f"Operating System: {telemetry.os}\n"
@@ -339,16 +436,14 @@ async def run_ai_investigation(
     ]
 
     response = await model.ainvoke(messages)
-    content = response.content
+    content = str(response.content)
 
-    # Determine health classification
     overall_health = "Healthy"
-    if telemetry.disk_percent and telemetry.disk_percent >= 85 or telemetry.cpu_percent and telemetry.cpu_percent >= 85:
+    if (telemetry.disk_percent and telemetry.disk_percent >= 85) or (telemetry.cpu_percent and telemetry.cpu_percent >= 85):
         overall_health = "Critical"
-    elif telemetry.disk_percent and telemetry.disk_percent >= 70 or telemetry.cpu_percent and telemetry.cpu_percent >= 70:
+    elif (telemetry.disk_percent and telemetry.disk_percent >= 70) or (telemetry.cpu_percent and telemetry.cpu_percent >= 70):
         overall_health = "Elevated"
 
-    # Extract bullet points/recommendations from response
     critical_issues = []
     recommendations = []
     lines = content.splitlines()
@@ -384,10 +479,10 @@ async def run_ai_investigation(
 # ==========================================
 
 def prompt_human_approval(report: AnalysisReport) -> str:
-    """Prompts the operator to approve or reject the AI recommendations.
-    
-    Strictly records decision; never executes destructive changes.
-    """
+    """Prompts the operator to approve or reject the AI recommendations."""
+    if report.overall_health == "Error":
+        return "N/A"
+
     console.print()
     console.rule("[bold yellow]HUMAN APPROVAL REQUIRED[/bold yellow]")
 
@@ -453,29 +548,19 @@ async def run_interactive_session(
             break
 
         # Check for VM switching intent
-        upper_input = user_input.upper()
-        switch_target = None
-        for target_id in ["VM001", "VM002", "VM003"]:
-            if target_id in upper_input:
-                # User mentioned a VM
-                if "INVESTIGATE" in upper_input or "SWITCH" in upper_input or upper_input.strip() == target_id:
-                    switch_target = target_id
-                    break
+        potential_vm = extract_vm_id(user_input)
+        is_switch_command = any(word in user_input.lower() for word in ["investigate", "switch", "examine", "check", "monitor"]) or user_input.upper() == potential_vm
 
-        if switch_target:
-            console.print(f"\n[bold yellow]Switching active target to {switch_target}...[/bold yellow]")
-            current_vm = switch_target
-            with console.status(f"[cyan]Collecting telemetry for {current_vm}...[/cyan]", spinner="dots"):
-                current_telemetry = await fetch_vm_telemetry(tools_map, current_vm)
+        if potential_vm and (is_switch_command or potential_vm != current_vm):
+            console.print(f"\n[bold yellow]Switching active target to {potential_vm}...[/bold yellow]")
+            current_vm = potential_vm
+            current_telemetry = await fetch_vm_telemetry(tools_map, current_vm)
             display_telemetry_tables(current_telemetry)
 
-            # Analyze newly selected VM
-            with console.status("[cyan]Analyzing telemetry with OpenAI...[/cyan]", spinner="dots"):
-                report = await run_ai_investigation(model, current_telemetry)
-            console.print(Panel(report.summary, title=f"AI Infrastructure Health Report — {current_vm}", border_style="cyan"))
+            report = await run_ai_investigation(model, current_telemetry)
+            console.print(Panel(Markdown(report.summary), title=f"AI Infrastructure Health Report — {current_vm}", border_style="cyan"))
             prompt_human_approval(report)
 
-            # Update context messages
             conversation_messages = [
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(content=f"Switched monitoring to {current_vm}. Status: {current_telemetry.status}."),
@@ -486,13 +571,12 @@ async def run_interactive_session(
         # Standard conversational query with agent
         conversation_messages.append(HumanMessage(content=user_input))
 
-        with console.status("[cyan]OpsPilot AI reasoning and invoking tools...[/cyan]", spinner="dots"):
-            try:
-                result = await agent_graph.ainvoke({"messages": conversation_messages})
-                conversation_messages = result["messages"]
-                latest_reply = conversation_messages[-1].content
-            except Exception as e:
-                latest_reply = f"[red]Error during agent reasoning: {str(e)}[/red]"
+        try:
+            result = await agent_graph.ainvoke({"messages": conversation_messages})
+            conversation_messages = result["messages"]
+            latest_reply = conversation_messages[-1].content
+        except Exception as e:
+            latest_reply = f"[red]Error during agent reasoning: {str(e)}[/red]"
 
         console.print()
         console.print(Panel(Markdown(latest_reply), title=f"[bold cyan]OpsPilot ({current_vm})[/bold cyan]", border_style="blue"))
@@ -508,7 +592,7 @@ async def main():
     console.print(Rule(style="cyan"))
     console.print(Panel.fit(
         "[bold cyan]OpsPilot AI[/bold cyan] — [bold white]Agentic Linux & Cloud Infrastructure Monitoring[/bold white]\n"
-        "[dim]LangChain Tool-Calling Agent • MCP Stdio Transport • FastMCP • OpenAI Reasoning[/dim]",
+        f"[dim]Model: {MODEL_NAME} (reasoning_effort={REASONING_EFFORT}) • FastMCP Stdio Transport • LangChain Middleware[/dim]",
         border_style="cyan"
     ))
     console.print(Rule(style="cyan"))
@@ -533,12 +617,12 @@ async def main():
             console.print("[red]No API key provided. Exiting OpsPilot AI.[/red]")
             return
 
-    # Initialize OpenAI Chat Model
+    # Initialize OpenAI Chat Model (gpt-5.6luna with reasoning_effort='none')
     try:
         model = ChatOpenAI(
             model=MODEL_NAME,
-            api_key=effective_api_key,
-            temperature=0.2
+            reasoning_effort=REASONING_EFFORT,
+            api_key=effective_api_key
         )
     except Exception as e:
         console.print(f"[bold red]Failed to initialize OpenAI model: {e}[/bold red]")
@@ -569,12 +653,12 @@ async def main():
                     keep=("messages", 4)
                 )
 
-                # Build LangChain agent with guardrails and context management middleware
+                # Build LangChain agent with guardrails, tool call visibility, and summarizer
                 agent_graph = create_agent(
                     model=model,
                     tools=tools,
                     system_prompt=SYSTEM_PROMPT,
-                    middleware=[guardrail_middleware, summarizer]
+                    middleware=[guardrail_middleware, visible_tool_logger, summarizer]
                 )
 
                 # ==========================================
@@ -585,21 +669,25 @@ async def main():
                 console.print(" • [bold cyan]VM002[/bold cyan] — Production Analytics Database (Critical Resource Exhaustion)")
                 console.print(" • [bold cyan]VM003[/bold cyan] — Staging Worker (Offline / Host Unreachable)\n")
 
-                vm_input = Prompt.ask("Enter VM ID to investigate", default="VM002").strip()
-                if not vm_input:
-                    vm_input = "VM002"
+                # Parse user input with natural language extraction
+                while True:
+                    vm_raw = Prompt.ask("Enter VM ID to investigate (VM002)", default="VM002").strip()
+                    extracted_vm = extract_vm_id(vm_raw)
+                    if extracted_vm:
+                        vm_input = extracted_vm
+                        break
+                    else:
+                        console.print(f"[bold red]Could not find a valid VM ID in '{vm_raw}'.[/bold red] [yellow]Please enter VM001, VM002, or VM003.[/yellow]")
 
-                console.print(f"\n[cyan]Starting automated investigation for [bold]{vm_input}[/bold]...[/cyan]")
+                console.print(f"\n[cyan]Starting automated investigation for [bold]{vm_input}[/bold]...[/cyan]\n")
 
-                with console.status("[cyan]Retrieving infrastructure telemetry via MCP tools...[/cyan]", spinner="dots"):
-                    telemetry = await fetch_vm_telemetry(tools_map, vm_input)
+                telemetry = await fetch_vm_telemetry(tools_map, vm_input)
 
                 # Render Telemetry Tables
                 display_telemetry_tables(telemetry)
 
                 # Run AI Analysis
-                with console.status("[cyan]OpenAI analyzing metrics and formulating recommendations...[/cyan]", spinner="dots"):
-                    report = await run_ai_investigation(model, telemetry)
+                report = await run_ai_investigation(model, telemetry)
 
                 # Render Analysis Report
                 console.print()
