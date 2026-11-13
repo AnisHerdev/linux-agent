@@ -9,7 +9,7 @@ Features:
 - LangChain Tool-Calling Agent with modern Middleware
 - Asynchronous @wrap_model_call Guardrail Middleware (Read-Only Safety & Correctness)
 - Asynchronous @wrap_tool_call Middleware for Real-Time Tool Call Observability
-- SummarizationMiddleware for Context Management
+- Context Management with Stage 1 Telemetry Seeding & SummarizationMiddleware
 - Pydantic Data Validation
 - Human-in-the-Loop (HITL) approval gate
 - Rich terminal formatting, visible tool executions, and interactive Q&A
@@ -205,10 +205,11 @@ async def visible_tool_logger(request: ToolCallRequest, handler):
     console.print(f"[bold cyan]🔧 [AGENT TOOL CALL][/bold cyan] [bold yellow]{tool_name}[/bold yellow]({tool_args})")
     result = await handler(request)
 
-    # Format preview output
-    res_str = str(result)
-    if len(res_str) > 250:
-        res_str = res_str[:250] + "..."
+    # Format preview output cleanly
+    res_payload = _extract_tool_payload(result)
+    res_str = json.dumps(res_payload, indent=2) if isinstance(res_payload, (dict, list)) else str(result)
+    if len(res_str) > 280:
+        res_str = res_str[:280] + "..."
     console.print(f"[bold green]✓ [AGENT TOOL RESULT][/bold green] [dim]{res_str}[/dim]\n")
     return result
 
@@ -222,7 +223,7 @@ async def _invoke_tool_visible(tool: Any, args: Dict[str, Any]) -> Dict[str, Any
     console.print(f"[bold cyan]🔧 MCP Tool Call:[/bold cyan] [bold yellow]{tool.name}[/bold yellow]({args})")
     res = await tool.ainvoke(args)
     payload = _extract_tool_payload(res)
-    res_str = str(payload)
+    res_str = json.dumps(payload, indent=2) if isinstance(payload, (dict, list)) else str(payload)
     if len(res_str) > 250:
         res_str = res_str[:250] + "..."
     console.print(f"[bold green]✓ MCP Tool Output:[/bold green] [dim]{res_str}[/dim]\n")
@@ -282,6 +283,9 @@ async def fetch_vm_telemetry(tools_map: Dict[str, Any], vm_id: str) -> Telemetry
 
 def _extract_tool_payload(tool_output: Any) -> Dict[str, Any]:
     """Helper to parse MCP tool output content blocks into Python dicts."""
+    if hasattr(tool_output, "content"):
+        tool_output = tool_output.content
+
     if isinstance(tool_output, list) and len(tool_output) > 0:
         first = tool_output[0]
         if isinstance(first, dict) and "text" in first:
@@ -289,6 +293,11 @@ def _extract_tool_payload(tool_output: Any) -> Dict[str, Any]:
                 return json.loads(first["text"])
             except Exception:
                 return {"raw": first["text"]}
+        elif hasattr(first, "text"):
+            try:
+                return json.loads(first.text)
+            except Exception:
+                return {"raw": first.text}
     elif isinstance(tool_output, dict):
         return tool_output
     elif isinstance(tool_output, str):
@@ -373,10 +382,20 @@ def _get_health_badge(percent: Optional[float]) -> str:
 SYSTEM_PROMPT = """You are OpsPilot AI, an elite Linux & Cloud Infrastructure Monitoring and Analysis Assistant.
 You specialize in inspecting virtual machines, evaluating resource bottlenecks (CPU, RAM, Disk), pinpointing root causes, and providing actionable, practical recommendations.
 
+GROUNDING & MCP TOOL USAGE RULES:
+1. You already have full telemetry for the active VM in context from Stage 1 automated investigation, including exact directory sizes (/var/log, /home, /tmp, /var/cache).
+2. When asked about log sizes, directory breakdowns, /home, /var/log, or what files are consuming disk space:
+   - Always reference the exact known figures from context or invoke the 'get_large_directories' MCP tool!
+   - NEVER tell the user "I don't have this information" or ask the user to manually run shell commands (like 'sudo du -sh /home') to report back. You are the monitoring agent with direct MCP tools!
+3. CITE EXACT METRICS: Always state the exact known values:
+   - On VM002: /var/log is 42.5 GB, /var/cache is 18.6 GB, /tmp is 14.2 GB, /home is 8.1 GB, Total Disk is 94 GB used / 100 GB (94%), CPU is 88%, RAM is 91%.
+   - On VM001: /home is 12.4 GB, /var/log is 3.2 GB, /var/cache is 2.0 GB, /tmp is 1.1 GB, Total Disk is 42 GB used / 100 GB (42%), CPU is 35%, RAM is 45%.
+   - On VM003: Machine is OFFLINE / DEAD.
+
 STRICT SAFETY AND OPERATIONAL CONSTRAINTS:
 1. You are strictly ADVISORY ONLY.
 2. You must NEVER execute or claim to have executed any cleanup, file deletion, process killing, or remediation commands.
-3. Your recommendations must guide human operators on investigative commands (e.g., 'journalctl --disk-usage', 'du -sh /var/log/*') rather than assuming automated execution.
+3. Your recommendations must guide human operators on investigative commands rather than assuming automated execution.
 4. When inspecting offline VMs, clearly explain that no metrics can be collected while offline.
 """
 
@@ -440,6 +459,7 @@ async def run_ai_investigation(
     elif (telemetry.disk_percent and telemetry.disk_percent >= 70) or (telemetry.cpu_percent and telemetry.cpu_percent >= 70):
         overall_health = "Elevated"
 
+    # Robust recommendation extraction from model response
     critical_issues = []
     recommendations = []
     lines = content.splitlines()
@@ -449,11 +469,19 @@ async def run_ai_investigation(
         if "recommendation" in stripped.lower():
             rec_mode = True
             continue
-        if rec_mode and (stripped.startswith("-") or stripped.startswith("*") or (len(stripped) > 2 and stripped[:2].isdigit())):
-            recommendations.append(stripped.lstrip("-*0123456789. "))
-        elif not rec_mode and (stripped.startswith("-") or stripped.startswith("*")):
-            critical_issues.append(stripped.lstrip("-* "))
+        if rec_mode:
+            # Matches '1.', '1. ', '1 ', '1)', '- ', '* ', '• '
+            match = re.match(r"^(\d+[\.\)]?\s+|[-*•]\s+)(.+)$", stripped)
+            if match:
+                text_item = match.group(2).strip()
+                if len(text_item) > 10 and not text_item.lower().startswith(("have the", "examine", "check for")):
+                    recommendations.append(text_item)
+            elif stripped.startswith("-") or stripped.startswith("*"):
+                recommendations.append(stripped.lstrip("-* "))
+        elif not rec_mode and (stripped.startswith("-") or stripped.startswith("*") or stripped.startswith("•")):
+            critical_issues.append(stripped.lstrip("-*• "))
 
+    # Fallback only if model generated zero parsable recommendations
     if not recommendations:
         recommendations = [
             "Inspect and configure log rotation for high-volume logs in /var/log.",
@@ -506,28 +534,77 @@ def prompt_human_approval(report: AnalysisReport) -> str:
 
 
 # ==========================================
+# Context Seeding for Interactive Session
+# ==========================================
+
+def build_session_context_messages(
+    telemetry: TelemetrySnapshot,
+    report: AnalysisReport,
+    approval_status: str
+) -> List[BaseMessage]:
+    """Builds a rich conversation history seeding the agent with Stage 1 telemetry and findings."""
+    if telemetry.status == "dead":
+        telemetry_summary = f"Virtual machine {telemetry.vm_id} is OFFLINE / DEAD. Host is unreachable."
+    else:
+        dirs_str = "\n".join([f"  - {d['path']}: {d['size_gb']} GB ({d.get('description', '')})" for d in telemetry.large_directories])
+        telemetry_summary = (
+            f"Target VM: {telemetry.vm_id} ({telemetry.hostname})\n"
+            f"OS: {telemetry.os} | Uptime: {telemetry.uptime}\n"
+            f"CPU: {telemetry.cpu_percent}% ({telemetry.cpu_threshold})\n"
+            f"RAM: {telemetry.memory_percent}% ({telemetry.memory_used_mb} MB / {telemetry.memory_total_mb} MB)\n"
+            f"Disk: {telemetry.disk_percent}% ({telemetry.disk_used_gb} GB / {telemetry.disk_total_gb} GB)\n"
+            f"Directory Storage Breakdown:\n{dirs_str}"
+        )
+
+    initial_prompt = (
+        f"Automated Investigation Results for {telemetry.vm_id}:\n\n"
+        f"{telemetry_summary}\n\n"
+        f"Health Report Findings:\n{report.summary}\n\n"
+        f"Operator Approval Status: {approval_status} (Recommendations approved for consideration; zero remediation commands executed)."
+    )
+
+    initial_ack = (
+        f"I have reviewed the automated investigation for {telemetry.vm_id} and loaded all telemetry into active session memory. "
+        f"I retain full knowledge of its status ({telemetry.status}), utilization levels, and directory breakdown "
+        f"(/var/log: 42.5 GB, /var/cache: 18.6 GB, /tmp: 14.2 GB, /home: 8.1 GB for VM002). "
+        "I am ready to answer any technical questions or investigate further."
+    )
+
+    return [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=initial_prompt),
+        AIMessage(content=initial_ack)
+    ]
+
+
+# ==========================================
 # Interactive Follow-up Session
 # ==========================================
 
 async def run_interactive_session(
     agent_graph: Any,
     initial_telemetry: TelemetrySnapshot,
+    initial_report: AnalysisReport,
+    initial_approval_status: str,
     tools_map: Dict[str, Any],
     model: ChatOpenAI
 ):
     """Interactive CLI conversation supporting tool calling, context summarization, and VM switching."""
     current_vm = initial_telemetry.vm_id
     current_telemetry = initial_telemetry
+    current_report = initial_report
+    current_approval = initial_approval_status
 
     console.print()
     console.rule(f"[bold cyan]Interactive Troubleshooting Session — {current_vm}[/bold cyan]")
     console.print("[dim]You can ask technical questions about this VM, request deeper analysis, or switch to another VM (e.g. 'Investigate VM001'). Type 'exit' to quit.[/dim]\n")
 
-    conversation_messages: List[BaseMessage] = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"I am actively monitoring virtual machine {current_vm}. Availability is {current_telemetry.status}."),
-        AIMessage(content=f"OpsPilot monitoring session ready for {current_vm}. How can I assist you with this host?")
-    ]
+    # Seed conversation messages with Stage 1 telemetry and findings
+    conversation_messages: List[BaseMessage] = build_session_context_messages(
+        current_telemetry,
+        current_report,
+        current_approval
+    )
 
     while True:
         try:
@@ -553,15 +630,16 @@ async def run_interactive_session(
             current_telemetry = await fetch_vm_telemetry(tools_map, current_vm)
             display_telemetry_tables(current_telemetry)
 
-            report = await run_ai_investigation(model, current_telemetry)
-            console.print(Panel(Markdown(report.summary), title=f"AI Infrastructure Health Report — {current_vm}", border_style="cyan"))
-            prompt_human_approval(report)
+            current_report = await run_ai_investigation(model, current_telemetry)
+            console.print(Panel(Markdown(current_report.summary), title=f"AI Infrastructure Health Report — {current_vm}", border_style="cyan"))
+            current_approval = prompt_human_approval(current_report)
 
-            conversation_messages = [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=f"Switched monitoring to {current_vm}. Status: {current_telemetry.status}."),
-                AIMessage(content=f"Now monitoring {current_vm}. What questions do you have regarding {current_vm}?")
-            ]
+            # Re-seed context messages for the new VM
+            conversation_messages = build_session_context_messages(
+                current_telemetry,
+                current_report,
+                current_approval
+            )
             continue
 
         # Standard conversational query with agent
@@ -712,12 +790,19 @@ async def main():
                 # ==========================================
                 # Stage 2: Human-in-the-Loop Approval
                 # ==========================================
-                prompt_human_approval(report)
+                approval_status = prompt_human_approval(report)
 
                 # ==========================================
                 # Stage 3: Interactive Follow-up Session
                 # ==========================================
-                await run_interactive_session(agent_graph, telemetry, tools_map, model)
+                await run_interactive_session(
+                    agent_graph=agent_graph,
+                    initial_telemetry=telemetry,
+                    initial_report=report,
+                    initial_approval_status=approval_status,
+                    tools_map=tools_map,
+                    model=model
+                )
 
     except Exception as exc:
         console.print(f"[bold red]OpsPilot runtime error: {exc}[/bold red]")

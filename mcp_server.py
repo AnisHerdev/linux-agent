@@ -253,7 +253,11 @@ def get_memory_usage(vm_id: str) -> dict:
 
 @mcp.tool()
 def get_disk_usage(vm_id: str) -> dict:
-    """Returns disk capacity, used space, available space, and utilization percentage.
+    """Returns overall filesystem disk capacity, used space, available space, and percentage for the VM.
+    
+    NOTE: This tool only provides global filesystem totals (e.g. 94 GB used / 100 GB total).
+    It does NOT provide directory-level details or log sizes.
+    To inspect specific directories (/var/log, /tmp, /home, /var/cache) or log file sizes, use get_large_directories instead.
     
     Args:
         vm_id: Unique virtual machine identifier (e.g. VM001, VM002, VM003).
@@ -288,7 +292,10 @@ def get_disk_usage(vm_id: str) -> dict:
 
 @mcp.tool()
 def get_large_directories(vm_id: str) -> dict:
-    """Identifies directories consuming the most storage on the virtual machine.
+    """Returns disk space consumed by specific top directories on the VM, including /var/log (system/service logs),
+    /var/cache (package caches), /tmp (temporary files/core dumps), and /home (user files).
+    
+    ALWAYS invoke this tool when asked about log sizes, /home space, directory breakdowns, or what files are taking up disk space.
     
     Args:
         vm_id: Unique virtual machine identifier (e.g. VM001, VM002, VM003).
