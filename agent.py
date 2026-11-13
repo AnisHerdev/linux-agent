@@ -5,9 +5,10 @@ Part of OpsPilot AI: Agentic Linux & Cloud Infrastructure Monitoring System.
 Connects to mcp_server.py via MCP stdio transport.
 Features:
 - OpenAI gpt-5.6luna reasoning with reasoning_effort set to 'none'
+- Upfront API Key Authentication & Model Verification
 - LangChain Tool-Calling Agent with modern Middleware
-- @wrap_model_call Guardrail Middleware (Read-Only Safety & Correctness)
-- @wrap_tool_call Middleware for Real-Time Tool Call Observability
+- Asynchronous @wrap_model_call Guardrail Middleware (Read-Only Safety & Correctness)
+- Asynchronous @wrap_tool_call Middleware for Real-Time Tool Call Observability
 - SummarizationMiddleware for Context Management
 - Pydantic Data Validation
 - Human-in-the-Loop (HITL) approval gate
@@ -31,7 +32,7 @@ load_dotenv()
 # ==========================================
 
 OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
-MODEL_NAME = "gpt-5.6luna"
+MODEL_NAME = "gpt-5.6-luna"
 REASONING_EFFORT = "none"
 
 # Rich CLI formatting
@@ -154,11 +155,11 @@ DISALLOWED_PATTERNS = [
 ]
 
 @wrap_model_call
-def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
-    """Wrap-style middleware hook to enforce guardrails and functional correctness.
+async def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
+    """Asynchronous wrap-style middleware hook to enforce guardrails and functional correctness.
     
     1. Pre-invocation: Inspects user messages to ensure advisory-only constraints.
-    2. Invocation: Calls the underlying model handler.
+    2. Invocation: Calls the underlying model handler asynchronously.
     3. Post-invocation: Verifies response correctness, advisory tone, and disclaimer.
     """
     for msg in request.messages:
@@ -173,7 +174,7 @@ def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
                 )
                 break
 
-    response = handler(request)
+    response = await handler(request)
 
     raw_content = ""
     if hasattr(response, "content") and response.content:
@@ -195,16 +196,16 @@ def guardrail_middleware(request: ModelRequest, handler) -> ModelResponse:
 
 
 @wrap_tool_call
-def visible_tool_logger(request: ToolCallRequest, handler):
-    """Tool middleware providing visible terminal logs whenever the agent invokes a tool."""
+async def visible_tool_logger(request: ToolCallRequest, handler):
+    """Asynchronous tool middleware providing visible terminal logs whenever the agent invokes a tool."""
     tool_call = request.tool_call
     tool_name = tool_call.get("name") if isinstance(tool_call, dict) else getattr(tool_call, "name", "unknown")
     tool_args = tool_call.get("args") if isinstance(tool_call, dict) else getattr(tool_call, "args", {})
 
     console.print(f"[bold cyan]🔧 [AGENT TOOL CALL][/bold cyan] [bold yellow]{tool_name}[/bold yellow]({tool_args})")
-    result = handler(request)
+    result = await handler(request)
 
-    # Format the preview output cleanly
+    # Format preview output
     res_str = str(result)
     if len(res_str) > 250:
         res_str = res_str[:250] + "..."
@@ -394,52 +395,47 @@ async def run_ai_investigation(
         )
 
     if telemetry.status == "dead":
-        return AnalysisReport(
-            vm_id=telemetry.vm_id,
-            overall_health="Offline",
-            summary=f"Virtual machine '{telemetry.vm_id}' is unreachable (Offline / Dead).",
-            critical_issues=[
-                "Host ping failure: No response from guest OS or hypervisor.",
-                "Service interruption: All hosted workloads on this VM are inactive."
-            ],
-            recommendations=[
-                "Verify power and hypervisor status from the cloud/virtualization console.",
-                "Inspect host virtualization logs for hardware or hypervisor faults.",
-                "Check network security group and DHCP lease status for the instance."
-            ]
+        prompt = (
+            f"Virtual Machine {telemetry.vm_id} ({telemetry.hostname or 'staging-worker-03'}, OS: {telemetry.os or 'Debian 12'}) "
+            "is completely OFFLINE / DEAD and unreachable. No CPU, memory, or disk telemetry could be collected.\n\n"
+            "As an infrastructure expert, analyze this outage incident and provide:\n"
+            "1. OVERALL HEALTH: Offline\n"
+            "2. ROOT CAUSE FINDINGS: (Analyze potential reasons for guest OS / hypervisor outage)\n"
+            "3. ACTIONABLE RECOMMENDATIONS: (Numbered list of 3-4 specific incident response steps for the SRE/admin)"
         )
-
-    # Telemetry summary for model
-    telemetry_summary = (
-        f"Virtual Machine: {telemetry.vm_id} ({telemetry.hostname})\n"
-        f"Operating System: {telemetry.os}\n"
-        f"Uptime: {telemetry.uptime}\n"
-        f"CPU Utilization: {telemetry.cpu_percent}%\n"
-        f"Memory Utilization: {telemetry.memory_percent}% ({telemetry.memory_used_mb}MB / {telemetry.memory_total_mb}MB)\n"
-        f"Disk Utilization: {telemetry.disk_percent}% ({telemetry.disk_used_gb}GB / {telemetry.disk_total_gb}GB)\n"
-        f"High Storage Directories:\n"
-        + "\n".join([f" - {d['path']}: {d['size_gb']} GB ({d['description']})" for d in telemetry.large_directories])
-    )
-
-    prompt = (
-        "Analyze the following Linux infrastructure telemetry metrics:\n\n"
-        f"{telemetry_summary}\n\n"
-        "Provide your analysis formatted with the following sections:\n"
-        "1. OVERALL HEALTH: [Healthy / Elevated / Critical]\n"
-        "2. ROOT CAUSE FINDINGS: (Key bottlenecks and what is causing them)\n"
-        "3. ACTIONABLE RECOMMENDATIONS: (Numbered list of 3-4 specific advisory steps for the system administrator)"
-    )
+    else:
+        telemetry_summary = (
+            f"Virtual Machine: {telemetry.vm_id} ({telemetry.hostname})\n"
+            f"Operating System: {telemetry.os}\n"
+            f"Uptime: {telemetry.uptime}\n"
+            f"CPU Utilization: {telemetry.cpu_percent}%\n"
+            f"Memory Utilization: {telemetry.memory_percent}% ({telemetry.memory_used_mb}MB / {telemetry.memory_total_mb}MB)\n"
+            f"Disk Utilization: {telemetry.disk_percent}% ({telemetry.disk_used_gb}GB / {telemetry.disk_total_gb}GB)\n"
+            f"High Storage Directories:\n"
+            + "\n".join([f" - {d['path']}: {d['size_gb']} GB ({d['description']})" for d in telemetry.large_directories])
+        )
+        prompt = (
+            "Analyze the following Linux infrastructure telemetry metrics:\n\n"
+            f"{telemetry_summary}\n\n"
+            "Provide your analysis formatted with the following sections:\n"
+            "1. OVERALL HEALTH: [Healthy / Elevated / Critical]\n"
+            "2. ROOT CAUSE FINDINGS: (Key bottlenecks and what is causing them)\n"
+            "3. ACTIONABLE RECOMMENDATIONS: (Numbered list of 3-4 specific advisory steps for the system administrator)"
+        )
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=prompt)
     ]
 
+    console.print(f"[cyan]Invoking OpenAI model [bold]{MODEL_NAME}[/bold] for analysis...[/cyan]")
     response = await model.ainvoke(messages)
     content = str(response.content)
 
     overall_health = "Healthy"
-    if (telemetry.disk_percent and telemetry.disk_percent >= 85) or (telemetry.cpu_percent and telemetry.cpu_percent >= 85):
+    if telemetry.status == "dead":
+        overall_health = "Offline"
+    elif (telemetry.disk_percent and telemetry.disk_percent >= 85) or (telemetry.cpu_percent and telemetry.cpu_percent >= 85):
         overall_health = "Critical"
     elif (telemetry.disk_percent and telemetry.disk_percent >= 70) or (telemetry.cpu_percent and telemetry.cpu_percent >= 70):
         overall_health = "Elevated"
@@ -625,8 +621,24 @@ async def main():
             api_key=effective_api_key
         )
     except Exception as e:
-        console.print(f"[bold red]Failed to initialize OpenAI model: {e}[/bold red]")
+        console.print(f"[bold red]Failed to initialize OpenAI client: {e}[/bold red]")
         return
+
+    # Proactive API Key & Model Validation
+    with console.status(f"[cyan]Validating OpenAI credentials with {MODEL_NAME}...[/cyan]", spinner="dots"):
+        try:
+            await model.ainvoke([HumanMessage(content="handshake ping")])
+            console.print(f"[green]✓ OpenAI API connection verified! Connected to {MODEL_NAME} successfully.[/green]\n")
+        except Exception as api_err:
+            console.print(Panel(
+                f"[bold red]OpenAI API Authentication Failed[/bold red]\n\n"
+                f"[yellow]{str(api_err)}[/yellow]\n\n"
+                "Please verify your [cyan]OPENAI_API_KEY[/cyan] in your [cyan].env[/cyan] file.\n"
+                f"Execution cannot proceed with an invalid API key.",
+                title="API Key Error",
+                border_style="red"
+            ))
+            return
 
     # MCP Server Parameters (launches mcp_server.py via stdio)
     server_params = StdioServerParameters(
@@ -653,7 +665,7 @@ async def main():
                     keep=("messages", 4)
                 )
 
-                # Build LangChain agent with guardrails, tool call visibility, and summarizer
+                # Build LangChain agent with async guardrails, async tool call visibility, and summarizer
                 agent_graph = create_agent(
                     model=model,
                     tools=tools,
@@ -686,7 +698,7 @@ async def main():
                 # Render Telemetry Tables
                 display_telemetry_tables(telemetry)
 
-                # Run AI Analysis
+                # Run AI Analysis (always uses OpenAI)
                 report = await run_ai_investigation(model, telemetry)
 
                 # Render Analysis Report
